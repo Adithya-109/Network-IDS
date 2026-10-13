@@ -93,6 +93,15 @@ def run_dpi_test(target):
     print(f"{BANNER} DPI traffic complete.")
 
 
+def run_anomaly(target, count=40):
+    print(f"{BANNER} Zero-Day / AI Anomaly Burst -> {target} ({count} packets)")
+    # Sends rapid packets that bypass static signatures and volumetric rules,
+    # forcing the Layer 3 Isolation Forest to detect the behavioral anomaly.
+    pkt = IP(dst=target) / ICMP()
+    send(pkt, count=count, inter=0.02, verbose=False)
+    print(f"{BANNER} AI Anomaly traffic complete.")
+
+
 def run_continuous(target, interval):
     print(f"{BANNER} Starting continuous attack simulation against {target} every {interval}s")
     print(f"{BANNER} Press Ctrl+C to stop.")
@@ -110,6 +119,8 @@ def run_continuous(target, interval):
             run_stealthscan(target)
             time.sleep(1)
             run_dpi_test(target)
+            time.sleep(1)
+            run_anomaly(target)
             
             print(f"\n{BANNER} Cycle complete. Sleeping for {interval} seconds...")
             time.sleep(interval)
@@ -123,7 +134,7 @@ def main():
     )
     parser.add_argument(
         "mode",
-        choices=["portscan", "synflood", "icmpflood", "udpflood", "stealthscan", "dpi", "all", "continuous"],
+        choices=["portscan", "synflood", "icmpflood", "udpflood", "stealthscan", "dpi", "anomaly", "all", "continuous"],
         help="Which attack pattern to simulate.",
     )
     parser.add_argument(
@@ -164,6 +175,9 @@ def main():
             time.sleep(1)
         if args.mode in ("dpi", "all"):
             run_dpi_test(args.target)
+            time.sleep(1)
+        if args.mode in ("anomaly", "all"):
+            run_anomaly(args.target)
     except PermissionError:
         print(
             "\nPermissionError: sending raw packets needs Administrator rights.\n"

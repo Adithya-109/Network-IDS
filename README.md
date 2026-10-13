@@ -65,6 +65,7 @@ sudo python3 demo.py icmpflood
 sudo python3 demo.py udpflood
 sudo python3 demo.py stealthscan
 sudo python3 demo.py dpi
+sudo python3 demo.py anomaly
 ```
 
 **Run an automated continuous attack loop:**
