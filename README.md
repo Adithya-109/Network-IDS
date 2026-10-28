@@ -100,6 +100,8 @@ Configured under `dynamic.adaptive_thresholds` in `rules.json`:
 | `drift.max_rise_frac` | default `0.02` | Max upward move of mean and σ per sample, as a fraction of the metric's floor (δ). |
 | `drift.ref_alpha` | default `0.01` | Learning rate of the long-term reference baseline (fast baseline uses `alpha`). |
 | `drift.rollback` | `true` / `false` | On a drift alarm, reset the fast baseline to the reference. |
+| `std_floor` | `poisson` (default), `none` | Floors σ at √mean, as for Poisson counts, so perfectly regular traffic (σ = 0, e.g. a monitor probing the same 20 ports every window) is not alerted at its own mean. |
+| `bootstrap_seconds` | default `0` (off) | Trusted training period from the first packet: baselines learn every window below the ceiling (even ones that alerted against a cold threshold) without the drift bound, so legitimately busy hosts get their own baselines. Assumes the period is attack-free. `rules.json` ships with `0` so demo attacks fired in the first minutes are never learned; on a real network set it (e.g. `300`) to a period you trust. Without it, a busy host only ever meets thresholds it exceeds, alerts on every window and never adapts. |
 
 With `drift_bounded`, a threshold can rise by at most (1 + k)·δ per window, so after n windows T ≤ T₀ + n(1 + k)·δ, whatever the attacker sends. A plain EMA under the same white-box attacker reaches the ceiling in about 12 windows. Window counts replace packet counts in `warmup_samples` when `update` is `window`.
 
@@ -120,7 +122,14 @@ Hot-reloading `rules.json` picks up `k_sigma`, limits, `update`, `cold_start`, `
     --out results/p_drift_rollback --trace-thresholds --trace-src 10.0.0.88
 ```
 
-The configs in `experiments/configs/poisoning/` isolate the volumetric layer: `p_static`, `p_legacy` (original design), `p_window_ema` (window updates without the drift bound), `p_mad`, `p_drift` and `p_drift_rollback`. `experiments/configs/full_legacy.json` runs all layers with the original adaptive design, for comparison with `full.json`.
+```bash
+# Heterogeneous hosts: busy benign hosts above the static thresholds plus quiet hosts attacked below them
+.venv/bin/python experiments/run_heterogeneous.py --seeds 1 2 3
+```
+
+`evaluate.py --exclude-first 300` scores only traffic after a 300 s training period, and `metrics.json` lists false-positive windows per source (`false_positive_units_by_src`).
+
+The configs in `experiments/configs/poisoning/` and `experiments/configs/heterogeneous/` isolate the volumetric layer: `p_static`, `p_legacy` (original design), `p_window_ema` (window updates without the drift bound), `p_mad`, `p_drift` and `p_drift_rollback`. `experiments/configs/full_legacy.json` runs all layers with the original adaptive design, for comparison with `full.json`.
 
 ## Reproducible Experiments (offline PCAP replay)
 

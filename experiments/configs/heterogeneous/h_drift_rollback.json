@@ -1,0 +1,31 @@
+{
+  "name": "h_drift_rollback",
+  "description": "Drift-bounded baseline with rollback and a 300 s training period.",
+  "seed": 42,
+  "overrides": {
+    "engine": {
+      "alert_cooldown": 0,
+      "layers": {
+        "stealth": false,
+        "volumetric": true,
+        "suspicious_port": false,
+        "dpi": false,
+        "ml": false,
+        "drift": true
+      }
+    },
+    "dynamic": {
+      "adaptive_thresholds": {
+        "method": "drift_bounded",
+        "drift": {
+          "rollback": true
+        },
+        "update": "window",
+        "population_prior": true,
+        "cold_start": "static",
+        "bootstrap_seconds": 300,
+        "std_floor": "poisson"
+      }
+    }
+  }
+}

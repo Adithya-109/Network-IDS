@@ -19,7 +19,9 @@
         "method": "ema",
         "update": "window",
         "population_prior": true,
-        "cold_start": "static"
+        "cold_start": "static",
+        "std_floor": "poisson",
+        "bootstrap_seconds": 300
       }
     }
   }

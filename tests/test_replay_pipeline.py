@@ -120,6 +120,13 @@ def test_evaluate_window_and_episode_metrics(tmp_path):
     assert eps["detected"] == 1  # the 10.0.0.0/30 episode never matches 10.0.0.5
     assert eps["episodes"][1]["time_to_detect"] == pytest.approx(0.5)
 
+    assert m["false_positive_units_by_src"] == {"10.0.0.9": 1}
+
+    # Excluding the first 5 s (100-104) drops the attack hit and leaves the FP at 106.
+    mx = evaluate.evaluate(run_dir, str(labels), window=1, exclude_first=5)
+    assert mx["units"] == 10
+    assert (mx["window_level"]["tp"], mx["window_level"]["fp"]) == (0, 1)
+
     # A 5s window merges seconds 100-104 into one attack unit for 10.0.0.5.
     m5 = evaluate.evaluate(run_dir, str(labels), window=5)
     assert m5["units"] == 4

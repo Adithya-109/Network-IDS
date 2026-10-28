@@ -59,6 +59,8 @@
       "update": "window",
       "population_prior": true,
       "cold_start": "static",
+      "std_floor": "poisson",
+      "bootstrap_seconds": 0,
       "alpha": 0.1,
       "drift": {
         "max_rise_frac": 0.02,

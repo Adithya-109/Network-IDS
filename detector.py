@@ -1,4 +1,5 @@
 import copy
+import dataclasses
 import logging
 import math
 from collections import defaultdict, deque
@@ -95,6 +96,8 @@ class DetectionEngine:
         self._pending = []
         # Optional callback receiving one dict per baseline sample (replay --trace-thresholds).
         self.trace = None
+        # Time of the first baseline sample; starts the bootstrap (training) period.
+        self._t0 = None
         
         self._last_alert = {}
         
@@ -204,6 +207,7 @@ class DetectionEngine:
             static=fallback_static,
             warmup=th_cfg.get("warmup_samples", 50),
             max_rise=th_cfg.get("drift", {}).get("max_rise_frac", 0.02) * floor,
+            poisson_std=th_cfg.get("std_floor", "none") == "poisson",
         )
 
     def _get_adaptive_threshold(self, src_ip, metric_name, current_val, fallback_static, now=None):
@@ -219,13 +223,30 @@ class DetectionEngine:
             return p.ceiling, True
         return p.clamp(p.static), True
         
+    def in_bootstrap(self, now):
+        """True during the trusted training period (adaptive_thresholds.bootstrap_seconds)."""
+        bootstrap = self._threshold_cfg().get("bootstrap_seconds", 0)
+        if not bootstrap or now is None:
+            return False
+        if self._t0 is None:
+            self._t0 = now
+        return now - self._t0 < bootstrap
+
     def update_baseline_if_normal(self, src_ip, metric_name, current_val, is_alert, now=None):
         if not self._is_dynamic_enabled():
             return
         fallback = RATE_METRICS.get(metric_name, {}).get("static", current_val)
         p = self._threshold_params(metric_name, fallback)
         tracker = None
-        if not is_alert:
+        if self.in_bootstrap(now):
+            # Training period, assumed attack-free: learn every sample below
+            # the ceiling, even ones that alerted against a cold threshold, so
+            # legitimately busy hosts get their own baselines. No drift bound.
+            is_alert = current_val >= p.ceiling
+            if not is_alert:
+                learn = dataclasses.replace(p, max_rise=math.inf, static=p.ceiling)
+                tracker = self.baselines.update_baseline(src_ip, metric_name, current_val, now, learn, trusted=True)
+        elif not is_alert:
             tracker = self.baselines.update_baseline(src_ip, metric_name, current_val, now, p)
         drifted = tracker is not None and hasattr(tracker, "drifted") and tracker.drifted(p)
         if self.trace is not None:

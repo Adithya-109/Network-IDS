@@ -19,7 +19,9 @@
         "method": "ema",
         "update": "packet",
         "population_prior": false,
-        "cold_start": "ceiling"
+        "cold_start": "ceiling",
+        "std_floor": "none",
+        "bootstrap_seconds": 0
       }
     }
   }

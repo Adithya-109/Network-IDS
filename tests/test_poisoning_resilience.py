@@ -11,7 +11,8 @@ SYN = "SYN_FLOOD"
 
 
 def _engine(**th):
-    th_cfg = {"method": "drift_bounded", "update": "window", "population_prior": True, "cold_start": "static"}
+    th_cfg = {"method": "drift_bounded", "update": "window", "population_prior": True,
+              "cold_start": "static", "bootstrap_seconds": 0}
     th_cfg.update(th)
     return DetectionEngine(offline=True, overrides={
         "engine": {"alert_cooldown": 0},
@@ -28,7 +29,7 @@ def test_white_box_attack_respects_linear_bound():
     assert bounded["bound_violations"] == 0
     # The bound allows T0 + n(1+k)delta = 10 + 0.8n, so >= 112 windows to reach 100.
     assert bounded["windows_to_ceiling"] >= (PARAMS.ceiling - bounded["t0"]) / ((1 + PARAMS.k_sigma) * PARAMS.max_rise)
-    assert bounded["first_drift_alarm"] is not None and bounded["first_drift_alarm"] < 40
+    assert bounded["first_drift_alarm"] is not None and bounded["first_drift_alarm"] < 60
     assert rollback["windows_to_ceiling"] is None
     assert rollback["threshold_at_300"] < PARAMS.static
 
@@ -93,7 +94,8 @@ def test_population_prior_seeds_new_sources():
     pop = e.baselines.population(SYN)
     assert pop.samples >= 50
     thresh, _ = e._get_adaptive_threshold("203.0.113.7", SYN, 0, 40, 200.0)
-    assert thresh == 10                  # population threshold (5 + 3*0 -> floor), not 40 or 100
+    # Population threshold 5 + 3*sqrt(5) (Poisson std floor), not the static 40 or ceiling 100.
+    assert thresh == pytest.approx(5 + 3 * 5 ** 0.5)
     e.stop()
 
 
@@ -116,3 +118,43 @@ def test_drift_alarm_raises_alert_and_rolls_back():
     assert "rolled back" in alerts[0]["description"]
     assert tracker.threshold(e._threshold_params(SYN, 40)) < 40
     e.stop()
+
+
+def test_bootstrap_lets_busy_hosts_learn_then_gates_again():
+    e = _engine(bootstrap_seconds=300)
+    busy = "10.9.0.5"
+    t = 0.0
+    while t < 300:                       # a legitimately busy host: 60 SYNs per 5 s window
+        for i in range(60):
+            e.check_syn_flood(busy, t + i * 0.08)
+        t += 5
+    tracker = e.baselines.get_tracker(busy, SYN, t)
+    p = e._threshold_params(SYN, 40)
+    assert tracker.samples >= 50
+    assert tracker.threshold(p) > 60     # learned its own level despite alerting against 40
+    learned = tracker.samples
+
+    for i in range(95):                  # after training: a window above its threshold alerts...
+        e.check_syn_flood(busy, t + i * 0.05)
+    e.check_syn_flood(busy, t + 6.0)     # ...and is not learned when it closes
+    # +1: the last training window [295, 300) closes on the first packet after training.
+    assert tracker.samples == learned + 1
+    e.stop()
+
+
+def test_bootstrap_never_learns_values_at_the_ceiling():
+    e = _engine(bootstrap_seconds=300)
+    src = "10.9.0.6"
+    for i in range(150):                 # 150 SYNs in one window during training: >= ceiling 100
+        e.check_syn_flood(src, 10.0 + i * 0.02)
+    e.check_syn_flood(src, 16.0)
+    assert e.baselines.get_tracker(src, SYN, 16.0).samples == 0
+    e.stop()
+
+
+def test_poisson_std_floor_gives_regular_traffic_headroom():
+    p = ThresholdParams(k_sigma=3, floor=5, ceiling=30, static=15, warmup=5, max_rise=0.1, poisson_std=True)
+    assert p.from_stats(20, 0.0) == 30   # 20 + 3*sqrt(20) = 33.4 -> ceiling, not 20
+    assert p.from_stats(4, 3.0) == 13    # real spread above sqrt(mean) is kept
+    plain = ThresholdParams(k_sigma=3, floor=5, ceiling=30, static=15, warmup=5, max_rise=0.1)
+    assert plain.from_stats(20, 0.0) == 20

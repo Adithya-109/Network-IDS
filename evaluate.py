@@ -20,6 +20,9 @@ Two views are reported:
 * Episode level. An episode counts as detected when its source raised an
   alert between ``start`` and ``end + grace``; time-to-detect is measured
   from ``start`` to that first alert.
+
+``exclude_first`` drops the first N seconds of traffic from the window-level
+scores, e.g. a detector's training (bootstrap) period.
 """
 
 import argparse
@@ -102,13 +105,17 @@ def binary_metrics(tp, fp, fn, tn):
     }
 
 
-def evaluate(run_dir, labels_path, window=1, grace=None):
+def evaluate(run_dir, labels_path, window=1, grace=None, exclude_first=0):
     """Returns the metrics dict for one run directory."""
     if window <= 0:
         raise ValueError("window must be positive")
     grace = window if grace is None else grace
     traffic, alerts = load_run(run_dir)
     episodes = load_labels(labels_path)
+    scored_from = None
+    if exclude_first and traffic:
+        scored_from = min(sec for sec, _, _ in traffic) + exclude_first
+        traffic = [t for t in traffic if t[0] >= scored_from]
 
     # Episodes per exact source address, resolved once per distinct source.
     episodes_for = {}
@@ -135,6 +142,8 @@ def evaluate(run_dir, labels_path, window=1, grace=None):
     predicted_by_layer = defaultdict(set)
     unmatched_alerts = 0
     for a in alerts:
+        if scored_from is not None and a["timestamp"] < scored_from:
+            continue
         unit = unit_of(a["timestamp"], a["src_ip"])
         if unit not in units:
             unmatched_alerts += 1
@@ -165,6 +174,11 @@ def evaluate(run_dir, labels_path, window=1, grace=None):
             "detected": hit,
             "recall": hit / len(label_units) if label_units else None,
         }
+
+    fp_by_src = defaultdict(int)
+    for unit in predicted:
+        if not units[unit]:
+            fp_by_src[unit[1]] += 1
 
     # Episode-level detection and time-to-detect.
     alerts_by_src = defaultdict(list)
@@ -201,6 +215,7 @@ def evaluate(run_dir, labels_path, window=1, grace=None):
         "labels": labels_path,
         "window_seconds": window,
         "grace_seconds": grace,
+        "excluded_first_seconds": exclude_first,
         "units": len(units),
         "attack_units": sum(1 for ls in units.values() if ls),
         "alerts": len(alerts),
@@ -208,6 +223,7 @@ def evaluate(run_dir, labels_path, window=1, grace=None):
         "window_level": confusion(predicted),
         "per_layer": {layer: confusion(pred) for layer, pred in sorted(predicted_by_layer.items())},
         "per_label": per_label,
+        "false_positive_units_by_src": dict(sorted(fp_by_src.items(), key=lambda kv: -kv[1])),
         "episode_level": {
             "episodes": len(episode_rows),
             "detected": len(detected),
@@ -257,11 +273,13 @@ def main():
     parser.add_argument("--labels", required=True, help="Ground-truth episode CSV.")
     parser.add_argument("--window", type=int, default=1, help="Evaluation window in seconds (default 1).")
     parser.add_argument("--grace", type=float, help="Seconds after an episode ends that still count (default: window).")
+    parser.add_argument("--exclude-first", type=float, default=0,
+                        help="Drop the first N seconds of traffic from window-level scores (training period).")
     parser.add_argument("--out", help="Where to write metrics JSON (default: <run_dir>/metrics.json).")
     parser.add_argument("--quiet", action="store_true", help="Only write the JSON.")
     args = parser.parse_args()
 
-    m = evaluate(args.run_dir, args.labels, window=args.window, grace=args.grace)
+    m = evaluate(args.run_dir, args.labels, window=args.window, grace=args.grace, exclude_first=args.exclude_first)
     out = args.out or os.path.join(args.run_dir, "metrics.json")
     with open(out, "w") as f:
         json.dump(m, f, indent=2)

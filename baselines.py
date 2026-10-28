@@ -15,9 +15,17 @@ class ThresholdParams:
     static: float      # operator's fixed threshold (config.py), used while cold
     warmup: int        # samples before a tracker's own statistics are trusted
     max_rise: float    # drift-bounded trackers: max upward move of mean/std per sample
+    poisson_std: bool = False  # floor std at sqrt(mean), as for Poisson counts
 
     def clamp(self, value):
         return min(max(value, self.floor), self.ceiling)
+
+    def from_stats(self, mean, std):
+        """mean + k * std, clamped. With poisson_std, perfectly regular traffic
+        (std 0) still gets headroom instead of a threshold equal to its mean."""
+        if self.poisson_std:
+            std = max(std, math.sqrt(max(mean, 0.0)))
+        return self.clamp(mean + self.k_sigma * std)
 
 class LRUTTLCache:
     """A simple thread-safe LRU cache with TTL eviction.
@@ -84,11 +92,13 @@ class BaselineTracker:
     def std(self):
         return math.sqrt(self.var)
 
-    def observe(self, value, params=None):
+    def observe(self, value, params=None, trusted=False):
         self.update(value)
 
     def threshold(self, params):
-        return self.get_threshold(params.k_sigma, params.floor, params.ceiling)
+        if self.mean is None:
+            return params.ceiling
+        return params.from_stats(self.mean, self.std)
 
     def get_threshold(self, k_sigma, floor, ceiling, is_warm=True):
         if not is_warm or self.mean is None:
@@ -130,7 +140,7 @@ class BoundedEMA:
         self.std = min(new_std, self.std + max_rise)
 
     def threshold(self, params):
-        return params.clamp(self.mean + params.k_sigma * self.std)
+        return params.from_stats(self.mean, self.std)
 
 
 class DriftBoundedTracker:
@@ -157,8 +167,9 @@ class DriftBoundedTracker:
     def std(self):
         return self.fast.std
 
-    def observe(self, value, params):
-        if self.ref.mean is None or value < self.ref.threshold(params):
+    def observe(self, value, params, trusted=False):
+        # trusted samples (bootstrap period) also train the reference ungated.
+        if trusted or self.ref.mean is None or value < self.ref.threshold(params):
             ref_rise = params.max_rise * self.ref.alpha / self.fast.alpha
             self.ref.update(value, params.static, ref_rise)
         self.fast.update(value, params.static, params.max_rise)
@@ -189,7 +200,7 @@ class MADTracker:
         self.mean = None  # the median, named for a uniform tracker interface
         self.std = 0.0    # 1.4826 * MAD (consistent with sigma for normal data)
 
-    def observe(self, value, params=None):
+    def observe(self, value, params=None, trusted=False):
         self.values.append(float(value))
         self.samples += 1
         ordered = sorted(self.values)
@@ -197,7 +208,7 @@ class MADTracker:
         self.std = 1.4826 * _median(sorted(abs(v - self.mean) for v in ordered))
 
     def threshold(self, params):
-        return params.clamp(self.mean + params.k_sigma * self.std)
+        return params.from_stats(self.mean, self.std)
 
 
 def _median(ordered):
@@ -250,11 +261,11 @@ class AdaptiveThresholds:
             self.cache.set(key, tracker, now)
         return tracker
 
-    def update_baseline(self, src_ip, metric_name, value, now=None, params=None):
+    def update_baseline(self, src_ip, metric_name, value, now=None, params=None, trusted=False):
         """Updates the baseline with a *normal* (non-malicious) measurement."""
         tracker = self.get_tracker(src_ip, metric_name, now, params.warmup if params else None)
-        tracker.observe(value, params)
+        tracker.observe(value, params, trusted)
         if self.population_prior:
-            self.population(metric_name).observe(value, params)
+            self.population(metric_name).observe(value, params, trusted)
         self.cache.set(f"{src_ip}_{metric_name}", tracker, now) # refresh TTL
         return tracker

@@ -21,7 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from baselines import ThresholdParams, tracker_factory
 
 # SYN_FLOOD limits from rules.json; max_rise = max_rise_frac (0.02) * floor.
-PARAMS = ThresholdParams(k_sigma=3.0, floor=10, ceiling=100, static=40, warmup=50, max_rise=0.2)
+PARAMS = ThresholdParams(k_sigma=3.0, floor=10, ceiling=100, static=40, warmup=50, max_rise=0.2,
+                         poisson_std=True)
 
 METHODS = {
     "ema": {"method": "ema"},
