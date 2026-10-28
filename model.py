@@ -13,11 +13,21 @@ except ImportError:
     ML_AVAILABLE = False
 
 class MLAnomalyEngine:
-    def __init__(self, retrain_interval_seconds=60, window_size=5000, contamination="auto", persist_dir="."):
+    def __init__(self, retrain_interval_seconds=60, window_size=5000, contamination="auto", persist_dir=".",
+                 persist=True, background=True, seed=42, n_estimators=100):
         self.retrain_interval_seconds = retrain_interval_seconds
         self.window_size = window_size
         self.contamination = contamination
         self.persist_dir = persist_dir
+        # Offline experiments run with persist=False (never load or overwrite
+        # model.joblib, so runs can't leak state into each other) and
+        # background=False (retraining is scheduled on packet time through
+        # maybe_retrain, which makes a replay deterministic).
+        self.persist = persist
+        self.background = background
+        self.seed = seed
+        self.n_estimators = n_estimators
+        self._last_train_ts = None
         
         self.ml_enabled = ML_AVAILABLE
         self.model = None
@@ -31,7 +41,8 @@ class MLAnomalyEngine:
         self._thread = None
         
         self.model_path = os.path.join(persist_dir, "model.joblib")
-        self.load_model()
+        if self.persist:
+            self.load_model()
         
     def load_model(self):
         if not self.ml_enabled:
@@ -46,6 +57,8 @@ class MLAnomalyEngine:
             logging.error(f"[MLEngine] Failed to load model: {e}")
 
     def save_model(self):
+        if not self.persist:
+            return
         try:
             with self._lock:
                 if self.model:
@@ -95,38 +108,56 @@ class MLAnomalyEngine:
                 logging.error(f"[MLEngine] Prediction error: {e}")
                 return 1
 
+    def retrain_once(self):
+        """Fits a fresh Isolation Forest on the current buffer. Returns True if a model was trained."""
+        if not self.ml_enabled:
+            return False
+
+        with self._lock:
+            buffer_copy = list(self.training_buffer)
+            
+        if len(buffer_copy) < min(100, self.window_size // 10):
+            # Not enough data to retrain
+            return False
+            
+        try:
+            new_model = IsolationForest(
+                n_estimators=self.n_estimators, 
+                contamination=self.contamination, 
+                random_state=self.seed
+            )
+            new_model.fit(buffer_copy)
+            
+            with self._lock:
+                self.model = new_model
+                self.is_trained = True
+            
+            self.save_model()
+            logging.info(f"[MLEngine] Retrained model on {len(buffer_copy)} samples.")
+            return True
+        except Exception as e:
+            logging.error(f"[MLEngine] Retraining failed: {e}")
+            return False
+
+    def maybe_retrain(self, now):
+        """Packet-time retraining schedule used when background=False."""
+        if self.background:
+            return False
+        if self._last_train_ts is None:
+            self._last_train_ts = now
+            return False
+        if now - self._last_train_ts < self.retrain_interval_seconds:
+            return False
+        self._last_train_ts = now
+        return self.retrain_once()
+
     def _retrain_loop(self):
         while self.running:
             time.sleep(self.retrain_interval_seconds)
-            if not self.ml_enabled:
-                continue
-                
-            with self._lock:
-                buffer_copy = list(self.training_buffer)
-                
-            if len(buffer_copy) < min(100, self.window_size // 10):
-                # Not enough data to retrain
-                continue
-                
-            try:
-                new_model = IsolationForest(
-                    n_estimators=100, 
-                    contamination=self.contamination, 
-                    random_state=42
-                )
-                new_model.fit(buffer_copy)
-                
-                with self._lock:
-                    self.model = new_model
-                    self.is_trained = True
-                
-                self.save_model()
-                logging.info(f"[MLEngine] Retrained model on {len(buffer_copy)} samples.")
-            except Exception as e:
-                logging.error(f"[MLEngine] Retraining failed: {e}")
+            self.retrain_once()
 
     def start(self):
-        if not self.ml_enabled or self.running:
+        if not self.ml_enabled or self.running or not self.background:
             return
         self.running = True
         self._thread = threading.Thread(target=self._retrain_loop, daemon=True)

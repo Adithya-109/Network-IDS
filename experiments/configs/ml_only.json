@@ -1,0 +1,12 @@
+{
+  "name": "ml_only",
+  "description": "Ablation: only the Isolation Forest, scoring every packet independently of the rules.",
+  "seed": 42,
+  "overrides": {
+    "engine": {
+      "alert_cooldown": 0,
+      "ml_independent": true,
+      "layers": {"stealth": false, "volumetric": false, "suspicious_port": false, "dpi": false, "ml": true}
+    }
+  }
+}

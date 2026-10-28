@@ -3,7 +3,13 @@
 # within a few seconds, while staying high enough to avoid false positives
 # from normal browsing traffic during a live demo.
 
+import os
+
 DB_PATH = "nids.db"
+
+# Interface for live capture. Defaults to loopback so demo.py traffic is seen;
+# set NIDS_IFACE (e.g. en0, eth0) to monitor a real interface.
+CAPTURE_IFACE = os.environ.get("NIDS_IFACE", "lo0")
 
 # Port scan: N distinct destination ports from the same source IP within WINDOW seconds
 PORT_SCAN_THRESHOLD = 15

@@ -1,0 +1,29 @@
+{
+  "name": "p_drift",
+  "description": "Drift-bounded baseline with long-term reference and drift alarm, no rollback.",
+  "seed": 42,
+  "overrides": {
+    "engine": {
+      "alert_cooldown": 0,
+      "layers": {
+        "stealth": false,
+        "volumetric": true,
+        "suspicious_port": false,
+        "dpi": false,
+        "ml": false,
+        "drift": true
+      }
+    },
+    "dynamic": {
+      "adaptive_thresholds": {
+        "method": "drift_bounded",
+        "drift": {
+          "rollback": false
+        },
+        "update": "window",
+        "population_prior": true,
+        "cold_start": "static"
+      }
+    }
+  }
+}

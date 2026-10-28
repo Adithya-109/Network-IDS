@@ -13,7 +13,10 @@ from detector import DetectionEngine
 
 # Imported lazily-ish at module load; Scapy prints a runtime warning on some
 # systems if certain optional dependencies are missing, which is harmless.
-from scapy.all import AsyncSniffer, get_if_list, conf, IP, TCP, UDP, ICMP, Raw
+from scapy.all import AsyncSniffer, get_if_list, conf
+from pipeline import parse_packet, analyze
+
+DASHBOARD_PORT = 5001
 
 
 class SnifferService:
@@ -47,36 +50,16 @@ class SnifferService:
             self.stats["packet_count"] += 1
             self._recent_ts.append(now)
 
-        if IP not in pkt:
+        info = parse_packet(pkt)
+        if info is None:
             with self._lock:
                 self.stats["other_count"] += 1
             return
 
-        ip_layer = pkt[IP]
-        src_ip, dst_ip = ip_layer.src, ip_layer.dst
-
-        proto_name = "OTHER"
-        dport = None
-        is_syn = False
-
-        is_web = False
-
-        if TCP in pkt:
-            proto_name = "TCP"
-            dport = int(pkt[TCP].dport)
-            sport = int(pkt[TCP].sport)
-            flags = pkt[TCP].flags
-            is_syn = bool(flags & 0x02) and not bool(flags & 0x10)  # SYN set, ACK clear
-            if sport == 5001 or dport == 5001:
-                is_web = True
-        elif UDP in pkt:
-            proto_name = "UDP"
-            dport = int(pkt[UDP].dport)
-        elif ICMP in pkt:
-            proto_name = "ICMP"
+        is_web = info.proto == "TCP" and DASHBOARD_PORT in (info.sport, info.dport)
 
         with self._lock:
-            count_key = f"{proto_name.lower()}_count"
+            count_key = f"{info.proto.lower()}_count"
             if count_key in self.stats:
                 self.stats[count_key] += 1
             else:
@@ -84,55 +67,13 @@ class SnifferService:
             if is_web:
                 self.stats["web_count"] += 1
 
-        alerts = []
-        payload_data = None
-        if Raw in pkt:
-            payload_data = pkt[Raw].load
-
         if is_web:
             # Skip analyzing the dashboard's own frontend-to-backend polling traffic
             # so the AI doesn't flag our own requests!
             return
 
-        if proto_name == "TCP" and dport is not None:
-            a = self.detector.check_stealth_scan(src_ip, dport, flags, now)
-            if a:
-                alerts.append(a)
-                
-            if is_syn:
-                a = self.detector.check_port_scan(src_ip, dport, now)
-                if a:
-                    alerts.append(a)
-                a = self.detector.check_syn_flood(src_ip, now)
-                if a:
-                    alerts.append(a)
-            a = self.detector.check_suspicious_port(src_ip, dport, now)
-            if a:
-                alerts.append(a)
-            if payload_data:
-                a = self.detector.check_dpi_payload(src_ip, dport, payload_data, now)
-                if a:
-                    alerts.append(a)
-        elif proto_name == "ICMP":
-            a = self.detector.check_icmp_flood(src_ip, now)
-            if a:
-                alerts.append(a)
-        elif proto_name == "UDP":
-            a = self.detector.check_udp_flood(src_ip, now)
-            if a:
-                alerts.append(a)
-                
-        # Machine Learning Anomaly Detection (Fallback - only check if no rules triggered)
-        if not alerts:
-            a = self.detector.check_ml_anomaly(src_ip, dst_ip, proto_name, len(pkt), now, flags=flags if proto_name == "TCP" else None, dport=dport)
-            if a:
-                alerts.append(a)
-
-        for a in alerts:
-            a["timestamp"] = now
-            a["src_ip"] = src_ip
-            a["dst_ip"] = dst_ip
-            a["protocol"] = proto_name
+        # Detection runs on the capture timestamp, the same clock replay.py uses.
+        for a in analyze(self.detector, info, float(pkt.time)):
             database.insert_alert(a)
 
     # -- lifecycle -----------------------------------------------------
@@ -194,7 +135,7 @@ class SnifferService:
                 self._sniffer = AsyncSniffer(
                     prn=self._handle_packet,
                     store=False,
-                    iface="lo0",
+                    iface=config.CAPTURE_IFACE,
                 )
                 self._sniffer.start()
             except Exception as exc:

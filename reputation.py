@@ -35,7 +35,7 @@ class IPTablesBlocker(BlockerBackend):
 
 class ReputationManager:
     """Manages IP risk scores, escalation, and temporary blocking."""
-    def __init__(self, block_ttl_seconds=300, dry_run=True, allowlist=None):
+    def __init__(self, block_ttl_seconds=300, dry_run=True, allowlist=None, background=True):
         self.block_ttl_seconds = block_ttl_seconds
         self.allowlist_cidrs = []
         if allowlist:
@@ -50,10 +50,14 @@ class ReputationManager:
         self.blocks = {} # src_ip -> unblock_ts
         self._lock = threading.Lock()
         
-        # Thread to clean up expired blocks
-        self.running = True
-        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
-        self._cleanup_thread.start()
+        # Thread to clean up expired blocks. Offline replay passes
+        # background=False and expiry is driven by packet time in add_alert.
+        self.background = background
+        self.running = background
+        self._cleanup_thread = None
+        if background:
+            self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
+            self._cleanup_thread.start()
         
     def is_allowlisted(self, ip_str):
         try:
@@ -80,6 +84,9 @@ class ReputationManager:
             return 0.0, False
             
         weight = {"High": 100.0, "Medium": 50.0, "Low": 20.0}.get(severity, 10.0)
+
+        if not self.background:
+            self.expire(now)
         
         with self._lock:
             old_score = 0.0
@@ -105,15 +112,18 @@ class ReputationManager:
                 
             return new_score, is_blocked
 
+    def expire(self, now):
+        """Lifts every block whose TTL has passed at time ``now``."""
+        with self._lock:
+            expired = [ip for ip, unblock_ts in self.blocks.items() if now >= unblock_ts]
+            for ip in expired:
+                self.blocker.unblock(ip)
+                del self.blocks[ip]
+
     def _cleanup_loop(self):
         while self.running:
             time.sleep(5)
-            now = time.time()
-            with self._lock:
-                expired = [ip for ip, unblock_ts in self.blocks.items() if now >= unblock_ts]
-                for ip in expired:
-                    self.blocker.unblock(ip)
-                    del self.blocks[ip]
+            self.expire(time.time())
                     
     def update_config(self, block_ttl_seconds, dry_run, allowlist):
         with self._lock:

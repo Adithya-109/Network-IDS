@@ -1,0 +1,11 @@
+{
+  "name": "volumetric_only",
+  "description": "Ablation: only the adaptive volumetric detectors (port scan, SYN/ICMP/UDP flood).",
+  "seed": 42,
+  "overrides": {
+    "engine": {
+      "alert_cooldown": 0,
+      "layers": {"stealth": false, "volumetric": true, "suspicious_port": false, "dpi": false, "ml": false}
+    }
+  }
+}
