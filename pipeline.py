@@ -72,17 +72,23 @@ def analyze(detector, info, now):
     # Baseline-drift alarms raised while the rate detectors updated their baselines.
     alerts.extend(detector.drain_alerts())
 
-    # Machine Learning Anomaly Detection. By default it is a fallback that
-    # only sees packets no rule fired on; "ml_independent" scores every packet.
-    if detector.layer_enabled("ml") and (not alerts or detector.engine_settings()["ml_independent"]):
-        add(detector.check_ml_anomaly(
-            info.src_ip, info.dst_ip, info.proto, info.length, now,
-            flags=info.flags if info.proto == "TCP" else None, dport=info.dport,
-        ))
+    # Machine Learning Anomaly Detection. Window mode sees every packet and
+    # reports on whole (source, window) aggregates when a window closes, so
+    # its alerts can be about other sources than this packet's. Packet mode
+    # is by default a fallback that only sees packets no rule fired on;
+    # "ml_independent" scores every packet.
+    if detector.layer_enabled("ml"):
+        if detector.ml_mode == "window":
+            alerts.extend(detector.observe_ml(info, now))
+        elif not alerts or detector.engine_settings()["ml_independent"]:
+            add(detector.check_ml_anomaly(
+                info.src_ip, info.dst_ip, info.proto, info.length, now,
+                flags=info.flags if info.proto == "TCP" else None, dport=info.dport,
+            ))
 
     for a in alerts:
-        a["timestamp"] = now
-        a["src_ip"] = info.src_ip
-        a["dst_ip"] = info.dst_ip
-        a["protocol"] = info.proto
+        a.setdefault("timestamp", now)
+        a.setdefault("src_ip", info.src_ip)
+        a.setdefault("dst_ip", info.dst_ip)
+        a.setdefault("protocol", info.proto)
     return alerts

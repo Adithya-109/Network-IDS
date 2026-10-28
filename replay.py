@@ -13,6 +13,7 @@ Writes into --out:
     run.json       config, input hashes, versions, timing and throughput
     thresholds.csv with --trace-thresholds: every baseline sample with the
                    tracker's mean, std, threshold and reference threshold
+    scores.csv     window-mode ML: anomaly score of every scored (window, source)
 """
 
 import argparse
@@ -89,6 +90,7 @@ def environment_info():
 
 TRACE_FIELDS = ["t", "src_ip", "metric", "value", "accepted", "samples", "mean", "std",
                 "threshold", "ref_threshold", "drifted"]
+SCORE_FIELDS = ["window_start", "window_seconds", "src_ip", "packets", "score", "threshold"]
 
 
 def run(pcaps, experiment, out_dir, rules_path=None, seed=None, limit=None, progress_every=100000,
@@ -115,6 +117,12 @@ def run(pcaps, experiment, out_dir, rules_path=None, seed=None, limit=None, prog
             if wanted is None or row["src_ip"] in wanted:
                 trace_w.writerow(row)
         engine.trace = write_trace
+    scores_f = None
+    if engine.ml_mode == "window":
+        scores_f = open(os.path.join(out_dir, "scores.csv"), "w", newline="")
+        scores_w = csv.DictWriter(scores_f, fieldnames=SCORE_FIELDS)
+        scores_w.writeheader()
+        engine.score_sink = scores_w.writerow
 
     traffic = Counter()  # (second, src_ip) -> packets
     alert_counts = Counter()
@@ -147,10 +155,16 @@ def run(pcaps, experiment, out_dir, rules_path=None, seed=None, limit=None, prog
 
                     if progress_every and packets % progress_every == 0:
                         print(f"[replay] {packets} packets...", file=sys.stderr)
+        if last_ts is not None:
+            for a in engine.finish_ml(last_ts):
+                alert_counts[a["detection_type"]] += 1
+                alerts_f.write(json.dumps(a, sort_keys=True) + "\n")
     wall_seconds = time.perf_counter() - wall_start
     engine.stop()
     if trace_f:
         trace_f.close()
+    if scores_f:
+        scores_f.close()
 
     with open(os.path.join(out_dir, "traffic.csv"), "w", newline="") as f:
         w = csv.writer(f)

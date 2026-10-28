@@ -22,7 +22,10 @@ Two views are reported:
   from ``start`` to that first alert.
 
 ``exclude_first`` drops the first N seconds of traffic from the window-level
-scores, e.g. a detector's training (bootstrap) period.
+scores, e.g. a detector's training (bootstrap) period. ``layers`` restricts
+the scored alerts to some detection layers (e.g. only "ml"), so one run can
+be evaluated per layer. If the run has a scores.csv (window-mode ML), the
+continuous anomaly scores also give ROC-AUC and PR-AUC over ML windows.
 """
 
 import argparse
@@ -34,6 +37,8 @@ import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
+
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 
 def parse_time(value):
@@ -105,12 +110,36 @@ def binary_metrics(tp, fp, fn, tn):
     }
 
 
-def evaluate(run_dir, labels_path, window=1, grace=None, exclude_first=0):
+def score_metrics(run_dir, episodes, scored_from=None):
+    """ROC-AUC / PR-AUC of the ML anomaly scores in scores.csv, or None without one."""
+    path = os.path.join(run_dir, "scores.csv")
+    if not os.path.exists(path):
+        return None
+    y, s = [], []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            start, width = float(row["window_start"]), float(row["window_seconds"])
+            if scored_from is not None and start < scored_from:
+                continue
+            src = row["src_ip"]
+            y.append(int(any(e.matches(src) and e.start < start + width and e.end >= start for e in episodes)))
+            s.append(float(row["score"]))
+    positives = sum(y)
+    result = {"scored_windows": len(y), "attack_windows": positives, "roc_auc": None, "pr_auc": None}
+    if 0 < positives < len(y):
+        result["roc_auc"] = roc_auc_score(y, s)
+        result["pr_auc"] = average_precision_score(y, s)
+    return result
+
+
+def evaluate(run_dir, labels_path, window=1, grace=None, exclude_first=0, layers=None):
     """Returns the metrics dict for one run directory."""
     if window <= 0:
         raise ValueError("window must be positive")
     grace = window if grace is None else grace
     traffic, alerts = load_run(run_dir)
+    if layers:
+        alerts = [a for a in alerts if a.get("layer") in layers]
     episodes = load_labels(labels_path)
     scored_from = None
     if exclude_first and traffic:
@@ -144,7 +173,8 @@ def evaluate(run_dir, labels_path, window=1, grace=None, exclude_first=0):
     for a in alerts:
         if scored_from is not None and a["timestamp"] < scored_from:
             continue
-        unit = unit_of(a["timestamp"], a["src_ip"])
+        # Window-mode ML alerts are raised when their window closes but describe that window.
+        unit = unit_of(a.get("window_start", a["timestamp"]), a["src_ip"])
         if unit not in units:
             unmatched_alerts += 1
             continue
@@ -216,6 +246,7 @@ def evaluate(run_dir, labels_path, window=1, grace=None, exclude_first=0):
         "window_seconds": window,
         "grace_seconds": grace,
         "excluded_first_seconds": exclude_first,
+        "layers": sorted(layers) if layers else None,
         "units": len(units),
         "attack_units": sum(1 for ls in units.values() if ls),
         "alerts": len(alerts),
@@ -224,6 +255,7 @@ def evaluate(run_dir, labels_path, window=1, grace=None, exclude_first=0):
         "per_layer": {layer: confusion(pred) for layer, pred in sorted(predicted_by_layer.items())},
         "per_label": per_label,
         "false_positive_units_by_src": dict(sorted(fp_by_src.items(), key=lambda kv: -kv[1])),
+        "score_level": score_metrics(run_dir, episodes, scored_from),
         "episode_level": {
             "episodes": len(episode_rows),
             "detected": len(detected),
@@ -263,6 +295,10 @@ def print_report(m, out=sys.stdout):
     for r in el["episodes"]:
         status = f"{r['time_to_detect']:.3f}s via {r['first_detection']}" if r["detected"] else "MISSED"
         print(f"  {r['label']:<14} {r['src_ip']:<18} {status}", file=out)
+    sl = m.get("score_level")
+    if sl:
+        print(f"\nML scores: {sl['scored_windows']} windows ({sl['attack_windows']} attack)  "
+              f"ROC-AUC {_fmt(sl['roc_auc'])}  PR-AUC {_fmt(sl['pr_auc'])}", file=out)
     if m["alerts_outside_traffic"]:
         print(f"\nwarning: {m['alerts_outside_traffic']} alerts did not map to a traffic unit", file=out)
 
@@ -273,13 +309,15 @@ def main():
     parser.add_argument("--labels", required=True, help="Ground-truth episode CSV.")
     parser.add_argument("--window", type=int, default=1, help="Evaluation window in seconds (default 1).")
     parser.add_argument("--grace", type=float, help="Seconds after an episode ends that still count (default: window).")
+    parser.add_argument("--layers", nargs="+", help="Only score alerts from these layers (e.g. ml).")
     parser.add_argument("--exclude-first", type=float, default=0,
                         help="Drop the first N seconds of traffic from window-level scores (training period).")
     parser.add_argument("--out", help="Where to write metrics JSON (default: <run_dir>/metrics.json).")
     parser.add_argument("--quiet", action="store_true", help="Only write the JSON.")
     args = parser.parse_args()
 
-    m = evaluate(args.run_dir, args.labels, window=args.window, grace=args.grace, exclude_first=args.exclude_first)
+    m = evaluate(args.run_dir, args.labels, window=args.window, grace=args.grace,
+                 exclude_first=args.exclude_first, layers=set(args.layers) if args.layers else None)
     out = args.out or os.path.join(args.run_dir, "metrics.json")
     with open(out, "w") as f:
         json.dump(m, f, indent=2)

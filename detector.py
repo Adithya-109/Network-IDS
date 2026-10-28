@@ -7,6 +7,7 @@ from collections import defaultdict, deque
 import config
 from rules_loader import RulesLoader, deep_merge
 from baselines import AdaptiveThresholds, LRUTTLCache, ThresholdParams, tracker_factory
+from features import WindowAggregator
 from model import MLAnomalyEngine
 from reputation import ReputationManager
 
@@ -117,6 +118,16 @@ class DetectionEngine:
         )
         
         ml_cfg = dyn_cfg.get("model_learning", {})
+        # "packet" (original): one Isolation Forest call per packet on packet
+        # features. "window": features per (source, window), scored in one
+        # batch per window, with a threshold calibrated to target_fpr.
+        self.ml_mode = ml_cfg.get("mode", "packet")
+        window_mode = self.ml_mode == "window"
+        self.ml_aggregator = WindowAggregator(ml_cfg.get("window_seconds", 5.0)) if window_mode else None
+        # Optional callback receiving one dict per scored ML window (replay writes scores.csv).
+        self.score_sink = None
+        # Last rule-based (non-ML) alert time per source, for clean ML training.
+        self._last_rule_alert = {}
         self.ml_engine = MLAnomalyEngine(
             retrain_interval_seconds=ml_cfg.get("retrain_interval_seconds", 60),
             window_size=ml_cfg.get("window_size", 5000),
@@ -125,6 +136,9 @@ class DetectionEngine:
             background=not offline,
             seed=ml_cfg.get("seed", 42),
             n_estimators=ml_cfg.get("n_estimators", 100),
+            buffer=ml_cfg.get("buffer", "recent"),
+            target_fpr=ml_cfg.get("target_fpr", 0.01) if window_mode else None,
+            model_filename="model_window.joblib" if window_mode else "model.joblib",
         )
         self.ml_engine.start()
         
@@ -298,6 +312,10 @@ class DetectionEngine:
         return alerts
 
     def _process_alert(self, src_ip, detection_type, severity, description, now, baseline_info=None, method="static", rule_id=None, category=None, layer=None):
+        if layer != "ml":
+            self._last_rule_alert[src_ip] = now
+            if len(self._last_rule_alert) > 50000:
+                self._last_rule_alert = {k: t for k, t in self._last_rule_alert.items() if now - t < 3600}
         score, is_blocked = self.reputation.add_alert(src_ip, severity, detection_type, now)
         
         alert = {
@@ -429,14 +447,84 @@ class DetectionEngine:
                                            method="static", rule_id=sig_id, category=category, layer="dpi")
         return None
 
+    def _ml_cfg(self):
+        return self._get_dynamic_config().get("model_learning", {})
+
+    @staticmethod
+    def _is_broadcast(dst_ip):
+        # Ignore noisy local broadcast/multicast traffic (like mDNS 224.0.0.251)
+        return bool(dst_ip) and (dst_ip.startswith("224.") or dst_ip.startswith("239.") or dst_ip.endswith(".255"))
+
+    def observe_ml(self, info, now):
+        """Window-mode ML: aggregates the packet; returns alerts for windows it closed."""
+        if not self.ml_engine.ml_enabled or self.ml_aggregator is None or not self._is_dynamic_enabled():
+            return []
+        if self._is_broadcast(info.dst_ip):
+            return []
+        closed = self.ml_aggregator.add(info, now)
+        return self._score_windows(closed, now) if closed else []
+
+    def finish_ml(self, now):
+        """Scores the still-open ML windows (end of a capture)."""
+        if self.ml_aggregator is None or not self._is_dynamic_enabled():
+            return []
+        closed = self.ml_aggregator.close()
+        return self._score_windows(closed, now) if closed else []
+
+    def _is_clean(self, src_ip, window_start, now, horizon, max_reputation):
+        """A window may train the model only if its source raised no rule alert
+        within ``horizon`` seconds before (or during) it and its reputation
+        score is below ``max_reputation``. Excluding sources for longer turns
+        every rule false positive into an under-represented, "anomalous" host."""
+        last = self._last_rule_alert.get(src_ip)
+        if last is not None and last >= window_start - horizon:
+            return False
+        return self.reputation.get_score(src_ip, now) < max_reputation
+
+    def _score_windows(self, closed, now):
+        start, srcs, X, counts = closed
+        cfg = self._ml_cfg()
+        width = self.ml_aggregator.width
+        self.ml_engine.maybe_retrain(now)
+        # A model fitted (and calibrated) on a handful of windows is mostly
+        # noise, so it neither alerts nor reports scores until it has seen enough.
+        ready = self.ml_engine.trained_on >= cfg.get("min_train_windows", 500)
+        scores = self.ml_engine.score_batch(X) if ready else None
+        threshold = self.ml_engine.threshold
+        clean_training = cfg.get("clean_training", True)
+        horizon = cfg.get("clean_horizon_seconds", 10)
+        max_reputation = cfg.get("clean_max_reputation", 50)
+        min_packets = cfg.get("min_window_packets", 1)
+
+        alerts = []
+        for i, src in enumerate(srcs):
+            rule_clean = not clean_training or self._is_clean(src, start, now, horizon, max_reputation)
+            if rule_clean:
+                self.ml_engine.add_calibration_sample(X[i].tolist())
+            score = None if scores is None else float(scores[i])
+            if self.score_sink is not None and score is not None:
+                self.score_sink({"window_start": start, "window_seconds": width, "src_ip": src,
+                                 "packets": counts[i], "score": score, "threshold": threshold})
+            if score is not None and threshold is not None and score > threshold and counts[i] >= min_packets:
+                if self._cooldown_ok((src, "ML_ANOMALY"), now):
+                    desc = (f"Abnormal traffic window from {src}: {counts[i]} packets in {width:g}s, "
+                            f"anomaly score {score:.3f} > {threshold:.3f}.")
+                    a = self._process_alert(src, "AI Anomaly (Isolation Forest)", "Low", desc, now,
+                                            method="ML", layer="ml")
+                    a.update(timestamp=now, src_ip=src, dst_ip=None, protocol="WINDOW",
+                             window_start=start, anomaly_score=score)
+                    alerts.append(a)
+            elif rule_clean:
+                self.ml_engine.add_clean_sample(X[i].tolist())
+        return alerts
+
     def check_ml_anomaly(self, src_ip, dst_ip, proto_name, packet_len, now, flags=None, dport=None):
         if not self.ml_engine.ml_enabled:
             return None
 
         self.ml_engine.maybe_retrain(now)
             
-        # Ignore noisy local broadcast/multicast traffic (like mDNS 224.0.0.251)
-        if dst_ip and (dst_ip.startswith("224.") or dst_ip.startswith("239.") or dst_ip.endswith(".255")):
+        if self._is_broadcast(dst_ip):
             return None
             
         # Per-IP packets per second tracker

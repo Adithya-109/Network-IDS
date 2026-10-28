@@ -1,0 +1,25 @@
+{
+  "name": "ml_packet",
+  "description": "Original ML layer: one Isolation Forest call per packet on packet features (contamination 0.01), scoring every packet; all other layers on.",
+  "seed": 42,
+  "overrides": {
+    "engine": {
+      "alert_cooldown": 0,
+      "layers": {
+        "stealth": true,
+        "volumetric": true,
+        "suspicious_port": true,
+        "dpi": true,
+        "ml": true,
+        "drift": true
+      },
+      "ml_independent": true
+    },
+    "dynamic": {
+      "model_learning": {
+        "mode": "packet",
+        "contamination": 0.01
+      }
+    }
+  }
+}
