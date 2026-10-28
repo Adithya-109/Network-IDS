@@ -3,12 +3,29 @@ import os
 import re
 import threading
 import time
+import copy
 import logging
 
+
+def deep_merge(target, source):
+    """Recursively merges ``source`` into ``target``; non-dict values replace."""
+    for k, v in source.items():
+        if isinstance(v, dict) and isinstance(target.get(k), dict):
+            deep_merge(target[k], v)
+        else:
+            target[k] = copy.deepcopy(v)
+    return target
+
+
 class RulesLoader:
-    """Loads and hot-reloads rules from rules.json and rules.d/ directory."""
-    def __init__(self, rules_path="rules.json"):
+    """Loads and hot-reloads rules from rules.json and rules.d/ directory.
+
+    ``overrides`` (e.g. from an experiment config) are deep-merged on top of
+    the files on every load, so a replay run can change thresholds or toggle
+    layers without editing rules.json."""
+    def __init__(self, rules_path="rules.json", overrides=None):
         self.rules_path = rules_path
+        self.overrides = overrides or {}
         self.rules_dir = os.path.join(os.path.dirname(rules_path), "rules.d")
         self.rules = {}
         self._lock = threading.Lock()
@@ -60,6 +77,8 @@ class RulesLoader:
                             logging.error(f"[RulesLoader] Failed to load {filepath}: {e}")
             except OSError:
                 pass
+
+        deep_merge(new_rules, self.overrides)
 
         # Compile regexes safely
         compiled_signatures = []
@@ -114,6 +133,9 @@ class RulesLoader:
                     target["dynamic"][k].update(v)
                 else:
                     target["dynamic"][k] = v
+
+        if "engine" in source:
+            deep_merge(target.setdefault("engine", {}), source["engine"])
 
     def _log_diff(self, old_rules, new_rules):
         if not old_rules:

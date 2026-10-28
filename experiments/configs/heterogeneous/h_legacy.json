@@ -1,0 +1,28 @@
+{
+  "name": "h_legacy",
+  "description": "Original adaptive design: gated EMA per packet, ceiling for cold sources, no training period.",
+  "seed": 42,
+  "overrides": {
+    "engine": {
+      "alert_cooldown": 0,
+      "layers": {
+        "stealth": false,
+        "volumetric": true,
+        "suspicious_port": false,
+        "dpi": false,
+        "ml": false,
+        "drift": true
+      }
+    },
+    "dynamic": {
+      "adaptive_thresholds": {
+        "method": "ema",
+        "update": "packet",
+        "population_prior": false,
+        "cold_start": "ceiling",
+        "std_floor": "none",
+        "bootstrap_seconds": 0
+      }
+    }
+  }
+}

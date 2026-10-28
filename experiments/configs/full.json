@@ -1,0 +1,8 @@
+{
+  "name": "full",
+  "description": "All layers as deployed (ML is a fallback for packets no rule fired on). Alert cooldown is 0 so every detection is scored by the evaluation.",
+  "seed": 42,
+  "overrides": {
+    "engine": {"alert_cooldown": 0}
+  }
+}

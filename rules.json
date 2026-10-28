@@ -55,6 +55,21 @@
   "dynamic": {
     "enabled": true,
     "adaptive_thresholds": {
+      "method": "drift_bounded",
+      "update": "window",
+      "population_prior": true,
+      "cold_start": "static",
+      "std_floor": "poisson",
+      "bootstrap_seconds": 0,
+      "alpha": 0.1,
+      "drift": {
+        "max_rise_frac": 0.02,
+        "ref_alpha": 0.01,
+        "rollback": true
+      },
+      "mad": {
+        "history": 100
+      },
       "k_sigma": 3.0,
       "warmup_samples": 50,
       "floor_limits": {

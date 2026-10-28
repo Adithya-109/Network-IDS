@@ -1,2 +1,9 @@
-flask
-scapy
+# Pinned for reproducible experiments (tested on Python 3.13).
+flask==3.1.3
+scapy==2.8.0
+scikit-learn==1.9.1
+numpy==2.5.4
+scipy==1.18.1
+joblib==1.6.0
+matplotlib==3.11.2
+pytest==8.4.2

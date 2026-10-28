@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 nids.db
 model.joblib
+.venv/
+.pytest_cache/
+.DS_Store
+# Experiment inputs and outputs (regenerate with experiments/make_synthetic.py and replay.py)
+data/
+results/

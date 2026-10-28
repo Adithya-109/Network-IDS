@@ -1,0 +1,9 @@
+{
+  "name": "static_baseline",
+  "description": "Baseline: fixed thresholds from config.py, no adaptive thresholds and no ML (dynamic layer disabled).",
+  "seed": 42,
+  "overrides": {
+    "engine": {"alert_cooldown": 0},
+    "dynamic": {"enabled": false}
+  }
+}

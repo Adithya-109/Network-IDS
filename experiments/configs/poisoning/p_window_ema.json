@@ -1,0 +1,28 @@
+{
+  "name": "p_window_ema",
+  "description": "Ablation: per-window updates, population prior and static cold start, but a plain EMA (no drift bound).",
+  "seed": 42,
+  "overrides": {
+    "engine": {
+      "alert_cooldown": 0,
+      "layers": {
+        "stealth": false,
+        "volumetric": true,
+        "suspicious_port": false,
+        "dpi": false,
+        "ml": false,
+        "drift": true
+      }
+    },
+    "dynamic": {
+      "adaptive_thresholds": {
+        "method": "ema",
+        "update": "window",
+        "population_prior": true,
+        "cold_start": "static",
+        "std_floor": "poisson",
+        "bootstrap_seconds": 300
+      }
+    }
+  }
+}

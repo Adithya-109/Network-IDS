@@ -1,15 +1,80 @@
-import time
+import copy
+import dataclasses
 import logging
+import math
 from collections import defaultdict, deque
 
 import config
-from rules_loader import RulesLoader
-from baselines import AdaptiveThresholds
+from rules_loader import RulesLoader, deep_merge
+from baselines import AdaptiveThresholds, LRUTTLCache, ThresholdParams, tracker_factory
 from model import MLAnomalyEngine
 from reputation import ReputationManager
 
+# Engine behaviour that experiments need to vary. Live defaults reproduce the
+# original demo behaviour; override them under the "engine" key of rules.json
+# or of an experiment config.
+ENGINE_DEFAULTS = {
+    # Seconds before re-alerting on the same (src_ip, detection) pair.
+    "alert_cooldown": config.ALERT_COOLDOWN,
+    # False: the ML layer only sees packets no rule fired on (live default).
+    # True: the ML layer scores every packet, so it can be evaluated on its own.
+    "ml_independent": False,
+    # Minimum per-second packet rate before an ML anomaly is reported.
+    "ml_min_pps": 10,
+    "layers": {
+        "stealth": True,
+        "volumetric": True,
+        "suspicious_port": True,
+        "dpi": True,
+        "ml": True,
+        "drift": True,
+    },
+}
+
+# Rate-based (volumetric) detectors, all handled by DetectionEngine.check_rate.
+RATE_METRICS = {
+    "PORT_SCAN": {
+        "name": "Port Scan", "severity": "High", "distinct": True,
+        "window": config.PORT_SCAN_WINDOW, "static": config.PORT_SCAN_THRESHOLD,
+        "desc": "{src} contacted {val} distinct ports within {window}s (threshold: {thresh:.1f})",
+    },
+    "SYN_FLOOD": {
+        "name": "SYN Flood", "severity": "High", "distinct": False,
+        "window": config.SYN_FLOOD_WINDOW, "static": config.SYN_FLOOD_THRESHOLD,
+        "desc": "{src} sent {val} TCP SYN packets within {window}s (threshold: {thresh:.1f})",
+    },
+    "ICMP_FLOOD": {
+        "name": "ICMP Flood", "severity": "Medium", "distinct": False,
+        "window": config.ICMP_FLOOD_WINDOW, "static": config.ICMP_FLOOD_THRESHOLD,
+        "desc": "{src} sent {val} ICMP echo requests within {window}s (threshold: {thresh:.1f})",
+    },
+    "UDP_FLOOD": {
+        "name": "UDP Flood", "severity": "Medium", "distinct": False,
+        "window": config.UDP_FLOOD_WINDOW, "static": config.UDP_FLOOD_THRESHOLD,
+        "desc": "{src} sent {val} UDP packets within {window}s (threshold: {thresh:.1f})",
+    },
+}
+
+
+class _Window:
+    """One tumbling baseline window of a (source, metric) pair.
+
+    Its sample is the peak sliding-window value seen during the window, i.e.
+    the same statistic the detector compares with the threshold."""
+    __slots__ = ("start", "peak", "alerted")
+
+    def __init__(self, start):
+        self.start = start
+        self.peak = 0
+        self.alerted = False
+
+
 class DetectionEngine:
-    def __init__(self):
+    def __init__(self, rules_path="rules.json", overrides=None, offline=False):
+        # offline=True is used for PCAP replay: no background threads, no
+        # model.joblib persistence and no real blocking, with every timer
+        # driven by packet timestamps so a run is deterministic.
+        self.offline = offline
         # Time buckets for rate calculations (simple 1-second buckets)
         self._last_bucket = defaultdict(int) # src_ip -> bucket_ts
         self._packet_count = defaultdict(int) # src_ip -> count_in_bucket
@@ -19,31 +84,56 @@ class DetectionEngine:
         self.syn_map = defaultdict(deque)
         self.icmp_map = defaultdict(deque)
         self.udp_map = defaultdict(deque)
+        self._rate_maps = {
+            "PORT_SCAN": self.port_scan_map,
+            "SYN_FLOOD": self.syn_map,
+            "ICMP_FLOOD": self.icmp_map,
+            "UDP_FLOOD": self.udp_map,
+        }
+        # Open baseline windows per (src_ip, metric) when baselines update per window.
+        self._windows = LRUTTLCache(maxsize=40000, ttl=600)
+        # Alerts raised outside a check's return value (baseline drift), drained by the pipeline.
+        self._pending = []
+        # Optional callback receiving one dict per baseline sample (replay --trace-thresholds).
+        self.trace = None
+        # Time of the first baseline sample; starts the bootstrap (training) period.
+        self._t0 = None
         
         self._last_alert = {}
         
-        self.rules_loader = RulesLoader()
-        self.rules_loader.start()
+        self.rules_loader = RulesLoader(rules_path=rules_path, overrides=overrides)
+        if not offline:
+            self.rules_loader.start()
+        self._engine_cache = (None, None)
         
         # Load initial config to set up dynamic modules
         rules = self.rules_loader.get_rules()
         dyn_cfg = rules.get("dynamic", {})
         
-        self.baselines = AdaptiveThresholds()
+        th_cfg = dyn_cfg.get("adaptive_thresholds", {})
+        self.baselines = AdaptiveThresholds(
+            factory=tracker_factory(th_cfg),
+            population_prior=th_cfg.get("population_prior", False),
+        )
         
         ml_cfg = dyn_cfg.get("model_learning", {})
         self.ml_engine = MLAnomalyEngine(
             retrain_interval_seconds=ml_cfg.get("retrain_interval_seconds", 60),
             window_size=ml_cfg.get("window_size", 5000),
-            contamination=ml_cfg.get("contamination", "auto")
+            contamination=ml_cfg.get("contamination", "auto"),
+            persist=not offline,
+            background=not offline,
+            seed=ml_cfg.get("seed", 42),
+            n_estimators=ml_cfg.get("n_estimators", 100),
         )
         self.ml_engine.start()
         
         rep_cfg = dyn_cfg.get("reputation", {})
         self.reputation = ReputationManager(
             block_ttl_seconds=rep_cfg.get("block_ttl_seconds", 300),
-            dry_run=rep_cfg.get("dry_run", True),
-            allowlist=rep_cfg.get("allowlist", [])
+            dry_run=True if offline else rep_cfg.get("dry_run", True),
+            allowlist=rep_cfg.get("allowlist", []),
+            background=not offline,
         )
 
         self.last_seen = defaultdict(float)
@@ -61,14 +151,27 @@ class DetectionEngine:
     def _is_dynamic_enabled(self):
         return self._get_dynamic_config().get("enabled", False)
 
+    def engine_settings(self):
+        """ENGINE_DEFAULTS merged with the "engine" rules section (cached per rules reload)."""
+        rules = self.rules_loader.get_rules()
+        cached_rules, settings = self._engine_cache
+        if cached_rules is not rules:
+            settings = deep_merge(copy.deepcopy(ENGINE_DEFAULTS), rules.get("engine", {}))
+            self._engine_cache = (rules, settings)
+        return settings
+
+    def layer_enabled(self, layer):
+        return self.engine_settings()["layers"].get(layer, True)
+
     def _cooldown_ok(self, key, now):
-        last = self._last_alert.get(key, 0)
-        if now - last >= config.ALERT_COOLDOWN:
+        cooldown = self.engine_settings()["alert_cooldown"]
+        last = self._last_alert.get(key)
+        if last is None or now - last >= cooldown:
             self._last_alert[key] = now
             
             # Prune old _last_alert entries to prevent memory leak
             if len(self._last_alert) > 5000:
-                keys_to_delete = [k for k, ts in self._last_alert.items() if now - ts > config.ALERT_COOLDOWN * 2]
+                keys_to_delete = [k for k, ts in self._last_alert.items() if now - ts > cooldown * 2]
                 for k in keys_to_delete:
                     del self._last_alert[k]
                     
@@ -91,34 +194,110 @@ class DetectionEngine:
             while len(dq) > 1000:
                 dq.popleft()
                 
-    def _get_adaptive_threshold(self, src_ip, metric_name, current_val, fallback_static):
+    def _threshold_cfg(self):
+        return self._get_dynamic_config().get("adaptive_thresholds", {})
+
+    def _threshold_params(self, metric_name, fallback_static):
+        th_cfg = self._threshold_cfg()
+        floor = th_cfg.get("floor_limits", {}).get(metric_name, fallback_static // 2)
+        return ThresholdParams(
+            k_sigma=th_cfg.get("k_sigma", 3.0),
+            floor=floor,
+            ceiling=th_cfg.get("ceiling_limits", {}).get(metric_name, fallback_static * 2),
+            static=fallback_static,
+            warmup=th_cfg.get("warmup_samples", 50),
+            max_rise=th_cfg.get("drift", {}).get("max_rise_frac", 0.02) * floor,
+            poisson_std=th_cfg.get("std_floor", "none") == "poisson",
+        )
+
+    def _get_adaptive_threshold(self, src_ip, metric_name, current_val, fallback_static, now=None):
         if not self._is_dynamic_enabled():
             return fallback_static, False
-            
-        dyn_cfg = self._get_dynamic_config()
-        th_cfg = dyn_cfg.get("adaptive_thresholds", {})
-        k_sigma = th_cfg.get("k_sigma", 3.0)
-        warmup = th_cfg.get("warmup_samples", 50)
+        p = self._threshold_params(metric_name, fallback_static)
+        tracker = self.baselines.get_tracker(src_ip, metric_name, now, p.warmup)
+        if tracker.samples >= p.warmup:
+            return tracker.threshold(p), True
+        # Cold source. "ceiling" is the original behaviour (least sensitive);
+        # "static" falls back to the operator's fixed threshold instead.
+        if self._threshold_cfg().get("cold_start", "ceiling") == "ceiling":
+            return p.ceiling, True
+        return p.clamp(p.static), True
         
-        floors = th_cfg.get("floor_limits", {})
-        ceilings = th_cfg.get("ceiling_limits", {})
-        
-        floor = floors.get(metric_name, fallback_static // 2)
-        ceiling = ceilings.get(metric_name, fallback_static * 2)
-        
-        tracker = self.baselines.get_tracker(src_ip, metric_name)
-        
-        is_warm = tracker.samples >= warmup
-        thresh = tracker.get_threshold(k_sigma, floor, ceiling, is_warm=is_warm)
-        
-        return thresh, True
-        
-    def update_baseline_if_normal(self, src_ip, metric_name, current_val, is_alert):
-        if not is_alert and self._is_dynamic_enabled():
-            self.baselines.update_baseline(src_ip, metric_name, current_val)
+    def in_bootstrap(self, now):
+        """True during the trusted training period (adaptive_thresholds.bootstrap_seconds)."""
+        bootstrap = self._threshold_cfg().get("bootstrap_seconds", 0)
+        if not bootstrap or now is None:
+            return False
+        if self._t0 is None:
+            self._t0 = now
+        return now - self._t0 < bootstrap
 
-    def _process_alert(self, src_ip, detection_type, severity, description, baseline_info=None, method="static", rule_id=None, category=None):
-        now = time.time()
+    def update_baseline_if_normal(self, src_ip, metric_name, current_val, is_alert, now=None):
+        if not self._is_dynamic_enabled():
+            return
+        fallback = RATE_METRICS.get(metric_name, {}).get("static", current_val)
+        p = self._threshold_params(metric_name, fallback)
+        tracker = None
+        if self.in_bootstrap(now):
+            # Training period, assumed attack-free: learn every sample below
+            # the ceiling, even ones that alerted against a cold threshold, so
+            # legitimately busy hosts get their own baselines. No drift bound.
+            is_alert = current_val >= p.ceiling
+            if not is_alert:
+                learn = dataclasses.replace(p, max_rise=math.inf, static=p.ceiling)
+                tracker = self.baselines.update_baseline(src_ip, metric_name, current_val, now, learn, trusted=True)
+        elif not is_alert:
+            tracker = self.baselines.update_baseline(src_ip, metric_name, current_val, now, p)
+        drifted = tracker is not None and hasattr(tracker, "drifted") and tracker.drifted(p)
+        if self.trace is not None:
+            self._trace_sample(src_ip, metric_name, current_val, not is_alert, now, p, drifted)
+        if drifted:
+            self._on_drift(src_ip, metric_name, tracker, p, now)
+
+    def _on_drift(self, src_ip, metric_name, tracker, p, now):
+        ref_thresh = tracker.reference_threshold(p)
+        desc = (f"{src_ip} {RATE_METRICS.get(metric_name, {}).get('name', metric_name)} baseline mean "
+                f"{tracker.mean:.1f} exceeds its long-term normal range (<= {ref_thresh:.1f}); "
+                f"possible slow-ramp poisoning or real traffic change.")
+        if self._threshold_cfg().get("drift", {}).get("rollback", False):
+            tracker.rollback()
+            desc += " Baseline rolled back."
+        if self.layer_enabled("drift") and self._cooldown_ok((src_ip, f"DRIFT_{metric_name}"), now):
+            self._pending.append(self._process_alert(
+                src_ip, "Baseline Drift (Possible Poisoning)", "Medium", desc, now,
+                baseline_info=f"mean={tracker.mean:.1f},ref_thresh={ref_thresh:.1f}",
+                method="adaptive", layer="drift"))
+
+    def _trace_sample(self, src_ip, metric_name, value, accepted, now, p, drifted):
+        tracker = self.baselines.get_tracker(src_ip, metric_name, now, p.warmup)
+        thresh, _ = self._get_adaptive_threshold(src_ip, metric_name, value, p.static, now)
+        ref = tracker.reference_threshold(p) if hasattr(tracker, "reference_threshold") else None
+        self.trace({
+            "t": now, "src_ip": src_ip, "metric": metric_name, "value": value,
+            "accepted": int(accepted), "samples": tracker.samples,
+            "mean": tracker.mean, "std": tracker.std, "threshold": thresh,
+            "ref_threshold": ref, "drifted": int(drifted),
+        })
+
+    def _observe_window(self, src_ip, metric_name, now, current_val, is_alert, width):
+        """Per-window baseline updates: a closed window feeds the baseline once."""
+        key = (src_ip, metric_name)
+        start = math.floor(now / width) * width
+        w = self._windows.get(key, now)
+        if w is not None and w.start != start:
+            self.update_baseline_if_normal(src_ip, metric_name, w.peak, w.alerted, now)
+            w = None
+        if w is None:
+            w = _Window(start)
+            self._windows.set(key, w, now)
+        w.peak = max(w.peak, current_val)
+        w.alerted = w.alerted or is_alert
+
+    def drain_alerts(self):
+        alerts, self._pending = self._pending, []
+        return alerts
+
+    def _process_alert(self, src_ip, detection_type, severity, description, now, baseline_info=None, method="static", rule_id=None, category=None, layer=None):
         score, is_blocked = self.reputation.add_alert(src_ip, severity, detection_type, now)
         
         alert = {
@@ -126,7 +305,8 @@ class DetectionEngine:
             "severity": severity,
             "description": description,
             "score": score,
-            "method": method
+            "method": method,
+            "layer": layer,
         }
         
         if rule_id:
@@ -140,82 +320,49 @@ class DetectionEngine:
             
         return alert
 
-    def check_port_scan(self, src_ip, dport, now):
-        dq = self.port_scan_map[src_ip]
-        dq.append((now, dport))
-        self._trim(dq, now, config.PORT_SCAN_WINDOW)
-        distinct_ports = {p for _, p in dq}
-        current_val = len(distinct_ports)
-        
-        thresh, is_dynamic = self._get_adaptive_threshold(src_ip, "PORT_SCAN", current_val, config.PORT_SCAN_THRESHOLD)
+    def check_rate(self, metric_name, src_ip, now, item=None):
+        """Sliding-window rate check shared by the port-scan and flood detectors."""
+        m = RATE_METRICS[metric_name]
+        dq = self._rate_maps[metric_name][src_ip]
+        if m["distinct"]:
+            dq.append((now, item))
+            self._trim(dq, now, m["window"])
+            current_val = len({p for _, p in dq})
+        else:
+            dq.append(now)
+            self._trim_flat(dq, now, m["window"])
+            current_val = len(dq)
+
+        thresh, is_dynamic = self._get_adaptive_threshold(src_ip, metric_name, current_val, m["static"], now)
         is_alert = current_val >= thresh
-        
-        self.update_baseline_if_normal(src_ip, "PORT_SCAN", current_val, is_alert)
-        
-        if is_alert:
-            if self._cooldown_ok((src_ip, "PORT_SCAN"), now):
-                desc = f"{src_ip} contacted {current_val} distinct ports within {config.PORT_SCAN_WINDOW}s (threshold: {thresh:.1f})"
-                return self._process_alert(src_ip, "Port Scan", "High", desc, 
-                                           baseline_info=f"thresh={thresh:.1f}", 
-                                           method="adaptive" if is_dynamic else "static")
+
+        # "packet" (original): every packet's sliding count updates the
+        # baseline, so consecutive samples are near-identical. "window": one
+        # update per closed tumbling window, skipped if that window alerted.
+        if self._threshold_cfg().get("update", "packet") == "window":
+            self._observe_window(src_ip, metric_name, now, current_val, is_alert, m["window"])
+        else:
+            self.update_baseline_if_normal(src_ip, metric_name, current_val, is_alert, now)
+
+        if is_alert and self._cooldown_ok((src_ip, metric_name), now):
+            desc = m["desc"].format(src=src_ip, val=current_val, window=m["window"], thresh=thresh)
+            return self._process_alert(src_ip, m["name"], m["severity"], desc, now,
+                                       layer="volumetric",
+                                       baseline_info=f"thresh={thresh:.1f}",
+                                       method="adaptive" if is_dynamic else "static")
         return None
+
+    def check_port_scan(self, src_ip, dport, now):
+        return self.check_rate("PORT_SCAN", src_ip, now, item=dport)
 
     def check_syn_flood(self, src_ip, now):
-        dq = self.syn_map[src_ip]
-        dq.append(now)
-        self._trim_flat(dq, now, config.SYN_FLOOD_WINDOW)
-        current_val = len(dq)
-        
-        thresh, is_dynamic = self._get_adaptive_threshold(src_ip, "SYN_FLOOD", current_val, config.SYN_FLOOD_THRESHOLD)
-        is_alert = current_val >= thresh
-        
-        self.update_baseline_if_normal(src_ip, "SYN_FLOOD", current_val, is_alert)
-        
-        if is_alert:
-            if self._cooldown_ok((src_ip, "SYN_FLOOD"), now):
-                desc = f"{src_ip} sent {current_val} TCP SYN packets within {config.SYN_FLOOD_WINDOW}s (threshold: {thresh:.1f})"
-                return self._process_alert(src_ip, "SYN Flood", "High", desc,
-                                           baseline_info=f"thresh={thresh:.1f}",
-                                           method="adaptive" if is_dynamic else "static")
-        return None
+        return self.check_rate("SYN_FLOOD", src_ip, now)
 
     def check_icmp_flood(self, src_ip, now):
-        dq = self.icmp_map[src_ip]
-        dq.append(now)
-        self._trim_flat(dq, now, config.ICMP_FLOOD_WINDOW)
-        current_val = len(dq)
-        
-        thresh, is_dynamic = self._get_adaptive_threshold(src_ip, "ICMP_FLOOD", current_val, config.ICMP_FLOOD_THRESHOLD)
-        is_alert = current_val >= thresh
-        
-        self.update_baseline_if_normal(src_ip, "ICMP_FLOOD", current_val, is_alert)
-        
-        if is_alert:
-            if self._cooldown_ok((src_ip, "ICMP_FLOOD"), now):
-                desc = f"{src_ip} sent {current_val} ICMP echo requests within {config.ICMP_FLOOD_WINDOW}s (threshold: {thresh:.1f})"
-                return self._process_alert(src_ip, "ICMP Flood", "Medium", desc,
-                                           baseline_info=f"thresh={thresh:.1f}",
-                                           method="adaptive" if is_dynamic else "static")
-        return None
+        return self.check_rate("ICMP_FLOOD", src_ip, now)
 
     def check_udp_flood(self, src_ip, now):
-        dq = self.udp_map[src_ip]
-        dq.append(now)
-        self._trim_flat(dq, now, config.UDP_FLOOD_WINDOW)
-        current_val = len(dq)
-        
-        thresh, is_dynamic = self._get_adaptive_threshold(src_ip, "UDP_FLOOD", current_val, config.UDP_FLOOD_THRESHOLD)
-        is_alert = current_val >= thresh
-        
-        self.update_baseline_if_normal(src_ip, "UDP_FLOOD", current_val, is_alert)
-        
-        if is_alert:
-            if self._cooldown_ok((src_ip, "UDP_FLOOD"), now):
-                desc = f"{src_ip} sent {current_val} UDP packets within {config.UDP_FLOOD_WINDOW}s (threshold: {thresh:.1f})"
-                return self._process_alert(src_ip, "UDP Flood", "Medium", desc,
-                                           baseline_info=f"thresh={thresh:.1f}",
-                                           method="adaptive" if is_dynamic else "static")
-        return None
+        return self.check_rate("UDP_FLOOD", src_ip, now)
 
     def check_stealth_scan(self, src_ip, dport, flags, now):
         scan_type = None
@@ -230,7 +377,8 @@ class DetectionEngine:
             key = (src_ip, f"STEALTH_{scan_type}")
             if self._cooldown_ok(key, now):
                 desc = f"{src_ip} sent a suspicious TCP packet with irregular flags ({scan_type}) to port {dport}."
-                return self._process_alert(src_ip, f"TCP Stealth Scan ({scan_type})", "High", desc, method="static")
+                return self._process_alert(src_ip, f"TCP Stealth Scan ({scan_type})", "High", desc, now,
+                                           method="static", layer="stealth")
         return None
 
     def check_suspicious_port(self, src_ip, dport, now):
@@ -242,7 +390,8 @@ class DetectionEngine:
             if self._cooldown_ok(key, now):
                 service = suspicious.get(str(dport), suspicious.get(dport, "Unknown"))
                 desc = f"{src_ip} accessed {service} port {dport} (often targeted by scanners)."
-                return self._process_alert(src_ip, "Suspicious Port Activity", "Low", desc, method="static")
+                return self._process_alert(src_ip, "Suspicious Port Activity", "Low", desc, now,
+                                           method="static", layer="suspicious_port")
         return None
 
     def check_dpi_payload(self, src_ip, dport, payload, now):
@@ -276,13 +425,15 @@ class DetectionEngine:
             key = (src_ip, f"DPI_{sig_name}")
             if self._cooldown_ok(key, now):
                 desc = f"{src_ip} sent malicious payload targeting port {dport}: {sig_name} signature matched."
-                return self._process_alert(src_ip, "Deep Packet Inspection (L7)", severity, desc, 
-                                           method="static", rule_id=sig_id, category=category)
+                return self._process_alert(src_ip, "Deep Packet Inspection (L7)", severity, desc, now,
+                                           method="static", rule_id=sig_id, category=category, layer="dpi")
         return None
 
     def check_ml_anomaly(self, src_ip, dst_ip, proto_name, packet_len, now, flags=None, dport=None):
         if not self.ml_engine.ml_enabled:
             return None
+
+        self.ml_engine.maybe_retrain(now)
             
         # Ignore noisy local broadcast/multicast traffic (like mDNS 224.0.0.251)
         if dst_ip and (dst_ip.startswith("224.") or dst_ip.startswith("239.") or dst_ip.endswith(".255")):
@@ -311,13 +462,14 @@ class DetectionEngine:
         if self._is_dynamic_enabled():
             prediction = self.ml_engine.predict(features)
             
-            # Require at least 10 packets per second to trigger an ML anomaly
+            # Require a minimum packet rate (default 10 pps) to trigger an ML anomaly
             # This prevents the AI from flagging random idle OS background noise
-            if prediction == -1 and pps >= 10:
+            if prediction == -1 and pps >= self.engine_settings()["ml_min_pps"]:
                 key = (src_ip, "ML_ANOMALY")
                 if self._cooldown_ok(key, now):
                     desc = f"Abnormal traffic pattern from {src_ip} (Avg IAT: {ema_iat:.4f}s, PPS: {pps})."
-                    return self._process_alert(src_ip, "AI Anomaly (Isolation Forest)", "Low", desc, method="ML")
+                    return self._process_alert(src_ip, "AI Anomaly (Isolation Forest)", "Low", desc, now,
+                                           method="ML", layer="ml")
             else:
                 self.ml_engine.add_clean_sample(features)
                 

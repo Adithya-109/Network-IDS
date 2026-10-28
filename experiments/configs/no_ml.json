@@ -1,0 +1,8 @@
+{
+  "name": "no_ml",
+  "description": "Ablation: every rule-based layer with adaptive thresholds, ML layer off.",
+  "seed": 42,
+  "overrides": {
+    "engine": {"alert_cooldown": 0, "layers": {"ml": false}}
+  }
+}
