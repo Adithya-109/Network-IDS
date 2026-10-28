@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 nids.db
 model.joblib
+model_window.joblib
 .venv/
 .pytest_cache/
 .DS_Store

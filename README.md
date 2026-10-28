@@ -14,8 +14,8 @@ A modern, multi-layered Intrusion Detection System built with **Python, Scapy, F
    - Inspects raw TCP headers for illegal flag combinations to detect stealth reconnaissance (NULL, XMAS, and FIN scans).
 3. **Continuous Machine Learning Anomaly Engine:** 
    - Utilizes Scikit-Learn's `IsolationForest` to learn your network's unique baseline automatically.
-   - Continuously retrains in the background on recent clean traffic to adapt to changing network conditions.
-   - Considers packet lengths, protocols, inter-arrival times (IAT), TCP flags, and per-IP packet rates.
+   - Scores one feature vector per source and 5 s window (volume, packet sizes, destination fan-out, port entropy, protocol mix, TCP flag ratios, inter-arrival times), all windows of a time step in one batch.
+   - Retrains periodically on *clean* windows only (no recent rule alert or high reputation score for that source), kept as a uniform reservoir sample, and calibrates its alert threshold to a target false-positive rate.
 4. **Dynamic Reputation & Auto-Response:**
    - Tracks per-IP risk scores that decay over time.
    - Automatically issues temporary blocks (via iptables or a dry-run logger) for IPs that exceed the score threshold.
@@ -131,6 +131,29 @@ Hot-reloading `rules.json` picks up `k_sigma`, limits, `update`, `cold_start`, `
 
 The configs in `experiments/configs/poisoning/` and `experiments/configs/heterogeneous/` isolate the volumetric layer: `p_static`, `p_legacy` (original design), `p_window_ema` (window updates without the drift bound), `p_mad`, `p_drift` and `p_drift_rollback`. `experiments/configs/full_legacy.json` runs all layers with the original adaptive design, for comparison with `full.json`.
 
+## ML Anomaly Layer
+
+Configured under `dynamic.model_learning` in `rules.json`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `mode` | `window` | `window`: per-(source, window) features scored in batches (see `features.py`). `packet`: the original per-packet model (8 packet features, `contamination`). |
+| `window_seconds` | `5` | Width of the ML windows (aligned to a global time grid). |
+| `buffer` | `reservoir` | `reservoir`: uniform sample of all clean windows seen; `recent`: the last `window_size` windows. |
+| `target_fpr` | `0.01` | Each retrain sets the alert threshold to the (1 − `target_fpr`) quantile of the new model's scores on a calibration reservoir of every rule-clean window, *including* ones the model flagged. Calibrating on the training buffer instead (which leaves flagged windows out) truncates the very tail the threshold sits in and more than doubles the false-positive rate. |
+| `clean_training` | `true` | Only windows whose source raised no rule alert in the last `clean_horizon_seconds` (default 10) and whose reputation score is below `clean_max_reputation` (default 50) are learned. Longer exclusions turn every rule false positive into an under-represented host that the model then flags. |
+| `min_train_windows` | `500` | No ML alerts or scores until the model was trained on this many windows (a model fitted on a handful of windows is mostly noise). |
+
+Window-mode alerts are raised when a window closes (detection latency ≤ `window_seconds`) and carry the `window_start` and `anomaly_score` of the window they describe. On a quiet machine with one source (e.g. the loopback demo), reaching `min_train_windows` takes about 40 minutes; the live model is saved to `model_window.joblib` and reused across restarts.
+
+```bash
+# ML sweep: per-packet vs window ML and ablations, scenario with the attacks played twice
+.venv/bin/python experiments/run_ml.py --seeds 1 2 3
+
+# Score only the ML layer of any run; with scores.csv this adds ROC-AUC / PR-AUC
+.venv/bin/python evaluate.py results/full --labels data/synthetic/labels.csv --window 5 --layers ml
+```
+
 ## Reproducible Experiments (offline PCAP replay)
 
 `replay.py` runs capture files through the same detection pipeline as live mode, using packet timestamps as the clock. Offline runs need no root, start no background threads, never load or overwrite `model.joblib`, never block anything and never write to `nids.db`. The same PCAP, config and seed always produce the same alerts.
@@ -151,5 +174,5 @@ The configs in `experiments/configs/poisoning/` and `experiments/configs/heterog
 
 - **Experiment configs** (`experiments/configs/*.json`) are deep-merged over `rules.json`. The `engine` section sets the alert cooldown, the ML layer's minimum packet rate, whether ML scores every packet (`ml_independent`) and which layers run. The shipped configs are `full`, `static_baseline`, `no_ml`, `ml_only` and `volumetric_only`.
 - **Ground truth** is a CSV of attack episodes: `label,src_ip,start,end`, where `src_ip` may be a CIDR and times are epoch seconds or ISO 8601 with a UTC offset.
-- **Run outputs**: `alerts.jsonl`, `traffic.csv` (packets per second per source, the evaluation's denominator), `run.json` (config, SHA-256 of the inputs and rules, package versions, git commit, wall time and throughput) and `metrics.json`.
+- **Run outputs**: `alerts.jsonl`, `traffic.csv` (packets per second per source, the evaluation's denominator), `run.json` (config, SHA-256 of the inputs and rules, package versions, git commit, wall time and throughput), `scores.csv` (window-mode ML: every scored window's anomaly score and threshold) and `metrics.json`.
 - **Tests**: `.venv/bin/python -m pytest -q`

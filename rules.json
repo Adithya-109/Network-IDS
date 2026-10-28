@@ -86,6 +86,14 @@
       }
     },
     "model_learning": {
+      "mode": "window",
+      "window_seconds": 5,
+      "buffer": "reservoir",
+      "target_fpr": 0.01,
+      "clean_training": true,
+      "clean_horizon_seconds": 10,
+      "clean_max_reputation": 50,
+      "min_train_windows": 500,
       "retrain_interval_seconds": 60,
       "window_size": 5000,
       "contamination": 0.01

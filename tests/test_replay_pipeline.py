@@ -149,3 +149,18 @@ def test_summarize_groups_seeds(tmp_path):
     assert row["recall"] == pytest.approx(0.9)
     assert row["recall_ci95"] > 0
     assert row["f1"] is None
+
+
+def test_window_ml_replay_writes_scores_and_aucs(scenario, tmp_path):
+    pcap, labels = scenario
+    exp = replay.load_experiment(os.path.join(CONFIGS, "ml", "ml_window.json"))
+    exp["overrides"]["dynamic"]["model_learning"]["min_train_windows"] = 100
+    run_dir = str(tmp_path / "ml_window")
+    replay.run([pcap], exp, run_dir, progress_every=0)
+    assert (tmp_path / "ml_window" / "scores.csv").exists()
+
+    m = evaluate.evaluate(run_dir, labels, window=5, layers={"ml"})
+    assert set(m["per_layer"]) <= {"ml"}
+    sl = m["score_level"]
+    assert sl["scored_windows"] > 0 and sl["attack_windows"] > 0
+    assert sl["roc_auc"] > 0.8

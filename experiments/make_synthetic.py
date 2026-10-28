@@ -107,12 +107,21 @@ def attack_traffic(rng, offset):
     return pkts, episodes
 
 
-def generate(out_dir, seed=1, warmup=120.0, duration=480.0):
+ROUND_SECONDS = 360.0  # one round of the six attacks spans [offset, offset + ~306)
+
+
+def generate(out_dir, seed=1, warmup=120.0, duration=None, rounds=1):
+    """Round r (r >= 2) repeats every attack ROUND_SECONDS later with labels suffixed "_r<r>"."""
     rng = random.Random(seed)
     os.makedirs(out_dir, exist_ok=True)
+    duration = duration or warmup + rounds * ROUND_SECONDS
     pkts = benign_traffic(rng, duration)
-    attacks, episodes = attack_traffic(rng, offset=warmup)
-    pkts.extend(attacks)
+    episodes = []
+    for r in range(rounds):
+        attacks, eps = attack_traffic(rng, offset=warmup + r * ROUND_SECONDS)
+        pkts.extend(attacks)
+        suffix = f"_r{r + 1}" if r else ""
+        episodes += [(label + suffix, src, start, end) for label, src, start, end in eps]
     pkts.sort(key=lambda tp: tp[0])
 
     pcap_path = os.path.join(out_dir, "scenario.pcap")
@@ -136,9 +145,11 @@ def main():
     parser.add_argument("--out", default="data/synthetic")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--warmup", type=float, default=120.0, help="Benign-only seconds before the first attack.")
-    parser.add_argument("--duration", type=float, default=480.0)
+    parser.add_argument("--duration", type=float, help="Default: warmup + rounds * 360 s.")
+    parser.add_argument("--rounds", type=int, default=1, help="Repeat the attack sequence this many times.")
     args = parser.parse_args()
-    pcap, labels, n = generate(args.out, seed=args.seed, warmup=args.warmup, duration=args.duration)
+    pcap, labels, n = generate(args.out, seed=args.seed, warmup=args.warmup, duration=args.duration,
+                               rounds=args.rounds)
     print(f"wrote {n} packets -> {pcap}\nlabels -> {labels}")
 
 

@@ -1,0 +1,30 @@
+{
+  "name": "ml_window_recent",
+  "description": "Ablation: window ML with a most-recent training buffer instead of a reservoir.",
+  "seed": 42,
+  "overrides": {
+    "engine": {
+      "alert_cooldown": 0,
+      "layers": {
+        "stealth": true,
+        "volumetric": true,
+        "suspicious_port": true,
+        "dpi": true,
+        "ml": true,
+        "drift": true
+      }
+    },
+    "dynamic": {
+      "model_learning": {
+        "mode": "window",
+        "window_seconds": 5,
+        "buffer": "recent",
+        "target_fpr": 0.01,
+        "clean_training": true,
+        "clean_horizon_seconds": 10,
+        "clean_max_reputation": 50,
+        "window_size": 1500
+      }
+    }
+  }
+}

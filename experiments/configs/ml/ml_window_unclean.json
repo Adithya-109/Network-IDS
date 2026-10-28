@@ -1,0 +1,30 @@
+{
+  "name": "ml_window_unclean",
+  "description": "Ablation: window ML trained on every window it doesn't flag itself, ignoring rule alerts and reputation.",
+  "seed": 42,
+  "overrides": {
+    "engine": {
+      "alert_cooldown": 0,
+      "layers": {
+        "stealth": true,
+        "volumetric": true,
+        "suspicious_port": true,
+        "dpi": true,
+        "ml": true,
+        "drift": true
+      }
+    },
+    "dynamic": {
+      "model_learning": {
+        "mode": "window",
+        "window_seconds": 5,
+        "buffer": "reservoir",
+        "target_fpr": 0.01,
+        "clean_training": false,
+        "clean_horizon_seconds": 10,
+        "clean_max_reputation": 50,
+        "window_size": 1500
+      }
+    }
+  }
+}
